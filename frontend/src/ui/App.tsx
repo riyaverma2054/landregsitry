@@ -1,11 +1,51 @@
-import { useMemo, useState } from "react";
-import { useAccount, useConnect, useDisconnect, useReadContract, useWriteContract } from "wagmi";
+import { useEffect, useMemo, useState } from "react";
+import {
+  useAccount,
+  useConnect,
+  useDisconnect,
+  useReadContract,
+  useSwitchChain,
+  useWaitForTransactionReceipt,
+  useWriteContract
+} from "wagmi";
 import { isAddress } from "viem";
-import { getLandRegistryAddress, landRegistryAbi } from "../contracts/landRegistry";
+import { getLandRegistryAddressForChain, landRegistryAbi } from "../contracts/landRegistry";
 
 function shortAddr(addr?: string) {
   if (!addr) return "";
   return `${addr.slice(0, 6)}…${addr.slice(-4)}`;
+}
+
+function storageKey(chainId: number | undefined) {
+  return `landRegistryAddress:${chainId ?? 31337}`;
+}
+
+type DemoLand = {
+  id: number;
+  parcelId: string;
+  location: string;
+  areaSqm: number;
+  owner: string;
+};
+
+function demoKey(chainId: number | undefined) {
+  return `demoLands:${chainId ?? 31337}`;
+}
+
+function loadDemo(chainId: number | undefined): DemoLand[] {
+  try {
+    const raw = localStorage.getItem(demoKey(chainId));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as DemoLand[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+function saveDemo(chainId: number | undefined, lands: DemoLand[]) {
+  localStorage.setItem(demoKey(chainId), JSON.stringify(lands));
 }
 
 function Card(props: { title: string; children: React.ReactNode }) {
@@ -53,10 +93,28 @@ function Button(props: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant
 }
 
 export function App() {
-  const contractAddress = useMemo(() => getLandRegistryAddress(), []);
   const { address, chain } = useAccount();
   const { connectors, connect, isPending: isConnecting } = useConnect();
   const { disconnect } = useDisconnect();
+  const { switchChain, isPending: isSwitchingChain } = useSwitchChain();
+
+  const [manualContractAddress, setManualContractAddress] = useState<string>("");
+  const [manualSavedForChain, setManualSavedForChain] = useState<`0x${string}` | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
+
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem(storageKey(chain?.id)) ?? "";
+      setManualContractAddress(v);
+      setManualSavedForChain(isAddress(v) ? (v as `0x${string}`) : null);
+    } catch {
+      setManualContractAddress("");
+      setManualSavedForChain(null);
+    }
+  }, [chain?.id]);
+
+  const contractCfg = useMemo(() => getLandRegistryAddressForChain(chain?.id), [chain?.id]);
+  const contractAddress = manualSavedForChain ?? contractCfg.address;
 
   const [parcelId, setParcelId] = useState("");
   const [location, setLocation] = useState("");
@@ -68,10 +126,36 @@ export function App() {
   const [transferId, setTransferId] = useState("");
   const [transferTo, setTransferTo] = useState("");
 
+  const contractReady = !!contractAddress;
+  const supportedChain = chain?.id === 31337 || chain?.id === 11155111;
+  const canPromptSwitch = !!address && (!supportedChain || !contractReady);
+
+  const { writeContractAsync, isPending: isWriting } = useWriteContract();
+  const [txMsg, setTxMsg] = useState<string | null>(null);
+  const [lastTxHash, setLastTxHash] = useState<`0x${string}` | null>(null);
+  const [pendingAction, setPendingAction] = useState<"register" | "transfer" | null>(null);
+
+  const { isLoading: isWaiting, isSuccess: txMined, isError: txFailed } = useWaitForTransactionReceipt({
+    hash: lastTxHash ?? undefined
+  });
+
+  const registerDisabledReason = !address
+    ? "Connect MetaMask."
+    : !supportedChain
+      ? "Switch network to Hardhat (31337) or Sepolia (11155111)."
+      : !contractReady && !demoMode
+        ? "Deploy the contract to this network and set the contract address."
+        : !parcelId.trim() || !location.trim() || !(Number.isFinite(Number(areaSqm)) && Number(areaSqm) > 0)
+          ? "Fill Parcel ID, Location and Area."
+          : isWaiting || isWriting
+            ? "Transaction pending…"
+            : null;
+
   const { data: nextId } = useReadContract({
-    address: contractAddress as `0x${string}`,
+    address: contractAddress ?? "0x0000000000000000000000000000000000000000",
     abi: landRegistryAbi,
-    functionName: "nextId"
+    functionName: "nextId",
+    query: { enabled: contractReady }
   });
 
   const {
@@ -80,7 +164,7 @@ export function App() {
     error: findErr,
     isFetching: isFinding
   } = useReadContract({
-    address: contractAddress as `0x${string}`,
+    address: contractAddress ?? "0x0000000000000000000000000000000000000000",
     abi: landRegistryAbi,
     functionName: "findByParcelId",
     args: lookupParcelId ? [lookupParcelId] : undefined,
@@ -93,57 +177,135 @@ export function App() {
     error: landErr,
     isFetching: isFetchingLand
   } = useReadContract({
-    address: contractAddress as `0x${string}`,
+    address: contractAddress ?? "0x0000000000000000000000000000000000000000",
     abi: landRegistryAbi,
     functionName: "getLand",
-    args: lookupId ? [BigInt(lookupId)] : undefined,
+    args: /^\d+$/.test(lookupId.trim()) ? [BigInt(lookupId.trim())] : undefined,
     query: { enabled: false }
   });
 
-  const { writeContractAsync, isPending: isWriting } = useWriteContract();
-  const [txMsg, setTxMsg] = useState<string | null>(null);
+  useEffect(() => {
+    if (!lastTxHash) return;
+    if (txMined) {
+      setTxMsg(
+        pendingAction === "register"
+          ? "Confirmed. Your land is registered. Now use Find/Get to read it from the contract."
+          : "Confirmed. Ownership transfer completed."
+      );
+      setPendingAction(null);
+    } else if (txFailed) {
+      setTxMsg("Transaction failed or was rejected. Check MetaMask for the exact reason.");
+      setPendingAction(null);
+    }
+  }, [lastTxHash, pendingAction, txFailed, txMined]);
 
   const canRegister =
-    !!address && parcelId.trim().length > 0 && location.trim().length > 0 && Number(areaSqm) > 0 && !isWriting;
+    (demoMode || contractReady) &&
+    !!address &&
+    supportedChain &&
+    parcelId.trim().length > 0 &&
+    location.trim().length > 0 &&
+    Number.isFinite(Number(areaSqm)) &&
+    Number(areaSqm) > 0 &&
+    !isWriting &&
+    !isWaiting;
 
   async function onRegister() {
     setTxMsg(null);
-    const id = await writeContractAsync({
-      address: contractAddress as `0x${string}`,
+    if (demoMode) {
+      const lands = loadDemo(chain?.id);
+      const trimmed = parcelId.trim();
+      const exists = lands.some((l) => l.parcelId.toLowerCase() === trimmed.toLowerCase());
+      if (exists) {
+        setTxMsg("Demo: This Parcel ID is already registered.");
+        return;
+      }
+      const newId = lands.length ? Math.max(...lands.map((l) => l.id)) + 1 : 1;
+      const land: DemoLand = {
+        id: newId,
+        parcelId: trimmed,
+        location: location.trim(),
+        areaSqm: Math.floor(Number(areaSqm)),
+        owner: address!
+      };
+      const next = [...lands, land];
+      saveDemo(chain?.id, next);
+      setTxMsg(`Demo: Successfully registered. ID = ${newId}`);
+      setLookupParcelId(trimmed);
+      setLookupId(String(newId));
+      setParcelId("");
+      setLocation("");
+      return;
+    }
+    setPendingAction("register");
+    const hash = (await writeContractAsync({
+      address: contractAddress!,
       abi: landRegistryAbi,
       functionName: "registerLand",
       args: [parcelId.trim(), location.trim(), BigInt(Math.floor(Number(areaSqm)))]
-    });
-    setTxMsg(`Transaction sent: ${id}`);
+    })) as `0x${string}`;
+    setLastTxHash(hash);
+    setTxMsg(`Transaction sent. Waiting for confirmation… (${hash.slice(0, 10)}…)`);
     setParcelId("");
     setLocation("");
   }
 
   async function onFind() {
     setTxMsg(null);
+    if (!lookupParcelId.trim()) return;
+    if (demoMode) {
+      const lands = loadDemo(chain?.id);
+      const hit = lands.find((l) => l.parcelId.toLowerCase() === lookupParcelId.trim().toLowerCase());
+      if (!hit) {
+        setTxMsg("Demo: Parcel not found.");
+        return;
+      }
+      setLookupId(String(hit.id));
+      setTxMsg(`Demo: Found ID = ${hit.id}`);
+      return;
+    }
+    if (!contractReady) return;
     await refetchFoundId();
   }
 
   async function onGetLand() {
     setTxMsg(null);
+    if (!/^\d+$/.test(lookupId.trim())) return;
+    if (demoMode) {
+      const lands = loadDemo(chain?.id);
+      const id = Number(lookupId.trim());
+      const hit = lands.find((l) => l.id === id);
+      if (!hit) {
+        setTxMsg("Demo: Land not found.");
+        return;
+      }
+      setTxMsg(`Demo: Verified Parcel ${hit.parcelId} (Owner ${shortAddr(hit.owner)})`);
+      return;
+    }
+    if (!contractReady) return;
     await refetchLand();
   }
 
   const canTransfer =
+    contractReady &&
     !!address &&
+    supportedChain &&
     transferId.trim().length > 0 &&
     isAddress(transferTo.trim()) &&
-    !isWriting;
+    !isWriting &&
+    !isWaiting;
 
   async function onTransfer() {
     setTxMsg(null);
-    const hash = await writeContractAsync({
-      address: contractAddress as `0x${string}`,
+    setPendingAction("transfer");
+    const hash = (await writeContractAsync({
+      address: contractAddress!,
       abi: landRegistryAbi,
       functionName: "transferOwnership",
       args: [BigInt(transferId.trim()), transferTo.trim() as `0x${string}`]
-    });
-    setTxMsg(`Transaction sent: ${hash}`);
+    })) as `0x${string}`;
+    setLastTxHash(hash);
+    setTxMsg(`Transaction sent. Waiting for confirmation… (${hash.slice(0, 10)}…)`);
     setTransferId("");
     setTransferTo("");
   }
@@ -156,7 +318,7 @@ export function App() {
             <div className="flex flex-col gap-1">
               <div className="text-2xl font-semibold tracking-tight">Land Registry</div>
               <div className="text-sm text-slate-300">
-                Register land parcels and transfer ownership on-chain (Hardhat local network).
+                Register land parcels and transfer ownership on-chain (Hardhat local or Sepolia testnet).
               </div>
             </div>
 
@@ -164,7 +326,9 @@ export function App() {
               <div className="text-sm text-slate-300">
                 <div>
                   <span className="text-slate-400">Contract</span>{" "}
-                  <span className="font-mono text-slate-200">{shortAddr(contractAddress)}</span>
+                  <span className="font-mono text-slate-200">
+                    {contractAddress ? shortAddr(contractAddress) : "Not configured"}
+                  </span>
                 </div>
                 <div>
                   <span className="text-slate-400">Next ID</span>{" "}
@@ -205,6 +369,67 @@ export function App() {
                 {txMsg}
               </div>
             ) : null}
+
+            {!contractReady ? (
+              <div className="rounded-2xl border border-amber-700/40 bg-amber-950/20 px-4 py-3 text-sm text-amber-100">
+                <div>{contractCfg.error}</div>
+                <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto] sm:items-end">
+                  <div>
+                    <div className="mb-1 text-xs font-medium text-amber-100/90">
+                      Set contract address for this network (saved in your browser)
+                    </div>
+                    <Input
+                      value={manualContractAddress}
+                      onChange={(e) => setManualContractAddress(e.target.value)}
+                      placeholder="0x..."
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      disabled={!isAddress(manualContractAddress)}
+                      onClick={() => {
+                        const v = manualContractAddress.trim();
+                        if (!isAddress(v)) return;
+                        localStorage.setItem(storageKey(chain?.id), v);
+                        setManualSavedForChain(v as `0x${string}`);
+                      }}
+                    >
+                      Save
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        localStorage.removeItem(storageKey(chain?.id));
+                        setManualContractAddress("");
+                        setManualSavedForChain(null);
+                      }}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                </div>
+                <div className="mt-2 text-xs text-amber-100/80">
+                  If you just deployed and wrote `frontend/.env.local`, restart `npm run dev` so Vite reloads env vars.
+                </div>
+                <div className="mt-3 rounded-xl border border-slate-800 bg-slate-950/30 p-3 text-xs text-slate-200">
+                  <div className="font-medium text-slate-100">No contract yet? Use Demo mode</div>
+                  <div className="mt-1 text-slate-300">
+                    Demo mode stores registrations in your browser so you can show “Registered” and “Verified” flows without gas.
+                  </div>
+                  <label className="mt-2 flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={demoMode}
+                      onChange={(e) => setDemoMode(e.target.checked)}
+                    />
+                    <span>Enable Demo mode (local verification)</span>
+                  </label>
+                </div>
+              </div>
+            ) : null}
           </header>
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -228,10 +453,40 @@ export function App() {
                   />
                 </div>
                 <Button onClick={onRegister} disabled={!canRegister}>
-                  {isWriting ? "Submitting..." : "Register"}
+                  {isWriting || (isWaiting && pendingAction === "register") ? "Submitting..." : "Register"}
                 </Button>
-                {!address ? (
-                  <div className="text-xs text-slate-400">Connect wallet to register land.</div>
+                {!canRegister && registerDisabledReason ? (
+                  <div className="text-xs text-amber-200">{registerDisabledReason}</div>
+                ) : null}
+                {!contractReady ? <div className="text-xs text-slate-400">Deploy contract and configure address.</div> : null}
+                {!address ? <div className="text-xs text-slate-400">Connect wallet to register land.</div> : null}
+                {canPromptSwitch ? (
+                  <div className="text-xs text-amber-200">
+                    <div>
+                      {supportedChain
+                        ? "Contract not configured for this network. Deploy and set the correct contract address."
+                        : "Unsupported network. Switch to Hardhat (31337) or Sepolia (11155111)."}
+                    </div>
+                    <div className="mt-2">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        disabled={isSwitchingChain}
+                        onClick={() => switchChain({ chainId: 31337 })}
+                      >
+                        {isSwitchingChain ? "Switching..." : "Switch network"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="ml-2"
+                        disabled={isSwitchingChain}
+                        onClick={() => switchChain({ chainId: 11155111 })}
+                      >
+                        {isSwitchingChain ? "Switching..." : "Switch to Sepolia"}
+                      </Button>
+                    </div>
+                  </div>
                 ) : null}
               </div>
             </Card>
@@ -304,12 +559,40 @@ export function App() {
                 <div className="text-xs text-slate-400">
                   Only the current owner can transfer a land ID.
                 </div>
+                {canPromptSwitch ? (
+                  <div className="text-xs text-amber-200">
+                    <div>
+                      {supportedChain
+                        ? "Contract not configured for this network. Deploy and set the correct contract address."
+                        : "Unsupported network. Switch to Hardhat (31337) or Sepolia (11155111)."}
+                    </div>
+                    <div className="mt-2">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        disabled={isSwitchingChain}
+                        onClick={() => switchChain({ chainId: 31337 })}
+                      >
+                        {isSwitchingChain ? "Switching..." : "Switch network"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="ml-2"
+                        disabled={isSwitchingChain}
+                        onClick={() => switchChain({ chainId: 11155111 })}
+                      >
+                        {isSwitchingChain ? "Switching..." : "Switch to Sepolia"}
+                      </Button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
             </Card>
           </div>
 
           <footer className="text-xs text-slate-500">
-            Tip: run `npx hardhat node` + deploy, then set `VITE_LAND_REGISTRY_ADDRESS` in `frontend/.env`.
+            Sepolia note: you need Sepolia ETH in your wallet to pay gas, and you must deploy the contract to Sepolia before Register is enabled.
           </footer>
         </div>
       </div>

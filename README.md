@@ -25,22 +25,25 @@ In a **new** terminal:
 
 ```bash
 cd contracts
-npx hardhat run scripts/deploy.ts --network localhost
+npm run deploy:localhost
 ```
 
-Copy the deployed contract address printed in the console.
+This also writes `frontend/.env.local` automatically with the correct contract address.
 
 ### 2) Frontend
 
 ```bash
 cd frontend
 npm install
+```
+
+If you didn’t use the deploy script, then do:
+
+```bash
 copy .env.example .env
 ```
 
-Edit `frontend/.env` and set:
-
-- `VITE_LAND_REGISTRY_ADDRESS` to the deployed address from step 1
+And set `VITE_LAND_REGISTRY_ADDRESS` to the deployed address.
 
 Run the app:
 
@@ -49,6 +52,40 @@ npm run dev
 ```
 
 Open the URL shown (usually `http://localhost:5173`).
+
+## Deploy to Sepolia testnet
+
+### 1) Configure environment
+
+Create `contracts/.env`:
+
+```bash
+cd contracts
+copy .env.example .env
+```
+
+Set:
+
+- `SEPOLIA_RPC_URL` (Alchemy/Infura/your RPC)
+- `DEPLOYER_PRIVATE_KEY` (testnet key with Sepolia ETH)
+
+### 2) Deploy
+
+```bash
+cd contracts
+npx hardhat run scripts/deploy.ts --network sepolia
+```
+
+This appends `VITE_LAND_REGISTRY_ADDRESS_11155111=...` into `frontend/.env.local`.
+
+### 3) Run frontend
+
+```bash
+cd frontend
+npm run dev
+```
+
+In MetaMask, switch to **Sepolia**. The UI will use the Sepolia contract automatically.
 
 ## Using MetaMask with Hardhat local node
 

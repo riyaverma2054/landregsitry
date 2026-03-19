@@ -75,9 +75,27 @@ export const landRegistryAbi = [
   }
 ] as const;
 
-export function getLandRegistryAddress() {
-  const addr = import.meta.env.VITE_LAND_REGISTRY_ADDRESS as string | undefined;
-  if (!addr) throw new Error("Missing VITE_LAND_REGISTRY_ADDRESS in frontend/.env");
-  return addr;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+export function getLandRegistryAddressForChain(
+  chainId: number | undefined
+): { address: `0x${string}` | null; error: string | null } {
+  const id = chainId ?? 31337;
+  const envKey = `VITE_LAND_REGISTRY_ADDRESS_${id}` as const;
+  const raw = ((import.meta as any).env?.[envKey] as string | undefined)?.trim();
+
+  if (!raw) {
+    return {
+      address: null,
+      error: `Missing ${envKey}. Deploy contracts to this network and set the address (deploy script auto-appends it to frontend/.env.local).`
+    };
+  }
+  if (!raw.startsWith("0x") || raw.length !== 42) {
+    return { address: null, error: `${envKey} is not a valid address.` };
+  }
+  if (raw.toLowerCase() === ZERO_ADDRESS) {
+    return { address: null, error: `${envKey} is still the placeholder zero-address. Deploy the contract and set the address.` };
+  }
+  return { address: raw as `0x${string}`, error: null };
 }
 
